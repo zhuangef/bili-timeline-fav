@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""Collect followed Bilibili video dynamics from a configured start date and add videos to a favorite list.
+
+Flow:
+    Bilibili dynamic video tab -> followed dynamic feed -> configured start date to now -> video posts
+    -> video duration >= minimum seconds -> add to target favorite folder.
+
+Authentication:
+    Export a browser cookie string after logging in to Bilibili and pass it with
+    --cookie, --cookie-file, or the BILI_COOKIE environment variable. The cookie
+    must include bili_jct for write operations.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import random
+import re
+import sys
+import time
+from dataclasses import dataclass
+from datetime import date, datetime, time as datetime_time, timezone
+from pathlib import Path
+from typing import Any
+
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, unquote
+from urllib.request import Request, build_opener
+
+import config
+
+# 关注动态流接口：对应 B 站动态页的视频投稿 Tab。
+DYNAMIC_FEED_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all"
+# 视频详情接口：用于根据 bvid/aid 查询 aid 与视频时长。
+VIDEO_VIEW_URL = "https://api.bilibili.com/x/web-interface/view"
+# 收藏操作接口：用于把视频添加到指定收藏夹。
+FAVORITE_DEAL_URL = "https://api.bilibili.com/x/v3/fav/resource/deal"
+# 收藏夹详情接口：用于读取当前收藏夹名称。
+FAVORITE_FOLDER_INFO_URL = "https://api.bilibili.com/x/v3/fav/folder/info"
+# 收藏夹新建接口：用于目标收藏夹已满时自动切换到新收藏夹。
+FAVORITE_FOLDER_ADD_URL = "https://api.bilibili.com/x/v3/fav/folder/add"
+FAVORITE_FOLDER_FULL_CODE = 11211
+# 关注分组接口：用于按关注分组名称解析该分组下的 UP 主。
+RELATION_TAGS_URL = "https://api.bilibili.com/x/relation/tags"
+RELATION_TAG_URL = "https://api.bilibili.com/x/relation/tag"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+RETRYABLE_HTTP_STATUS = {412, 429, 500, 502, 503, 504}
+
+
+class BilibiliAPIError(RuntimeError):
+    """B 站接口返回非成功响应。"""
+
+
+@dataclass(frozen=True)
+class DynamicVideo:
+    """从动态流中提取出的单个视频投稿信息。"""
+    dynamic_id: str
+    bvid: str
+    aid: int | None
+    title: str
+    pub_ts: int
+    up_name: str
+    up_mid: int | None
+
+
+class BilibiliDynamicFavoriter:
+    """负责扫描动态流、筛选视频并执行收藏的主流程类。"""
+    def __init__(
+        self,
+        cookie: str,
+        media_id: int,
+        state_path: Path,
+        start_date: date,
+        min_duration: int,
+        page_sleep: float,
+        action_sleep: float,
+        max_retries: int,
+        retry_sleep: float,
+        dry_run: bool,
+        follow_groups: list[str],
+    ) -> None:
+        self.media_id = media_id
+        self.state_path = state_path
+        self.start_date = start_date
+        self.min_duration = min_duration
+        self.page_sleep = page_sleep
+        self.action_sleep = action_sleep
+        self.max_retries = max_retries
+        self.retry_sleep = retry_sleep
+        self.dry_run = dry_run
+        self.follow_groups = follow_groups
+        self.cookie = cookie
+        self.user_mid = read_cookie_value(cookie, "DedeUserID")
+        self.opener = build_opener()
+        self.headers = {
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Referer": "https://t.bilibili.com/?tab=video",
+            "Origin": "https://www.bilibili.com",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Connection": "keep-alive",
+            "X-Requested-With": "XMLHttpRequest",
+            "Cookie": cookie,
+        }
+        # B 站收藏接口需要 bili_jct 作为 CSRF token。
+        self.csrf = read_cookie_value(cookie, "bili_jct")
+        self.original_media_id = media_id
+        self.favorite_folder_title: str | None = None
+        self.state = load_state(state_path)
+
+    def run(self) -> dict[str, int]:
+        stats = {
+            "seen_dynamic": 0,
+            "candidate_video": 0,
+            "skipped_processed": 0,
+            "skipped_old": 0,
+            "skipped_short": 0,
+            "skipped_group": 0,
+            "favorited": 0,
+            "failed": 0,
+        }
+        # 以指定日期当天 00:00 作为动态发布时间筛选边界，一直扫描到当前最新投稿。
+        cutoff_ts = start_of_date_ts(self.start_date)
+        logging.info("Start scanning followed video dynamics since %s", format_ts(cutoff_ts))
+        allowed_up_mids = self.fetch_follow_group_mids(self.follow_groups)
+        
+        print("======稍等一下，正在载入动态视频流======")
+
+        videos = sorted(self.iter_recent_video_dynamics(cutoff_ts), key=lambda item: item.pub_ts)
+        logging.info("Collected %s recent video dynamics; processing from oldest to newest", len(videos))
+
+        for video in videos:
+            stats["candidate_video"] += 1
+            if allowed_up_mids is not None and video.up_mid not in allowed_up_mids:
+                stats["skipped_group"] += 1
+                print("=========================================================")
+                logging.info(
+                    "OutofGroup:🥡 bvid=%s duration=%s 🎬 up=%s title=%s",
+                        video.bvid,
+                        format_duration(duration),
+                        video.up_name,
+                        video.title,
+                )
+                continue
+                
+            # 使用 bvid 优先作为去重键；没有 bvid 时退回 aid。
+            dedupe_key = video.bvid or str(video.aid)
+            if dedupe_key in self.state["processed_bvids"]:
+                stats["skipped_processed"] += 1
+                print("=========================================================")
+                logging.info("Skip processed:➡️ bvid=%s duration=%s 🎬 up=%s title=%s",
+                        video.bvid,
+                        format_duration(duration),
+                        video.up_name,
+                        video.title,
+                )
+                continue
+
+            try:
+                # 动态卡片里的信息不一定完整，先查询视频详情确认 aid 与时长。
+                aid, duration, upload_ts = self.fetch_video_info(video)
+                if duration < self.min_duration:
+                    stats["skipped_short"] += 1
+                    print("=========================================================")
+                    logging.info(
+                        "Skip short:❌  bvid=%s duration=%s 🎬 up=%s title=%s",
+                        video.bvid,
+                        format_duration(duration),
+                        video.up_name,
+                        video.title,
+                    )
+                    self.mark_processed(dedupe_key, "short", video, upload_ts)
+                    continue
+
+                if self.dry_run:
+                    logging.info(
+                        "dry_run:💧  bvid=%s duration=%s 🎬 up=%s title=%s",
+                        video.bvid,
+                        format_duration(duration),
+                        video.up_name,
+                        video.title,
+                    )
+                else:
+                    # 只有通过时间窗口、视频类型和时长筛选后才真正收藏。
+                    self.add_to_favorite(aid)
+                    print("=========================================================")
+                    logging.info(
+                        "Favorited:✅  bvid=%s duration=%s 🎬 up=%s title=%s",
+                        video.bvid,
+                        format_duration(duration),
+                        video.up_name,
+                        video.title,
+                    )
+                stats["favorited"] += 1
+                self.mark_processed(dedupe_key, "favorited" if not self.dry_run else "dry_run", video, upload_ts)
+                time.sleep(self.action_sleep)
+            except HTTPError as exc:
+                stats["failed"] += 1
+                logging.error("HTTP failure for %s after retries: %s", video.bvid, format_http_error(exc))
+            except (BilibiliAPIError, URLError) as exc:
+                stats["failed"] += 1
+                logging.error("API/network failure for %s after retries: %s", video.bvid, exc)
+            except (KeyError, TypeError, ValueError) as exc:
+                stats["failed"] += 1
+                logging.exception("Parse failure for %s: %s", video.bvid, exc)
+
+        self.save_state()
+        logging.info("Finished with stats: %s", stats)
+        return stats
+
+    def iter_recent_video_dynamics(self, cutoff_ts: int) -> Any:
+        # B 站动态流使用 offset 分页，第一页传空字符串。
+        offset = ""
+        page = 0
+        while True:
+            page += 1
+            payload = self.get_json(
+                DYNAMIC_FEED_URL,
+                params={"type": "video", "offset": offset, "timezone_offset": -480},
+            )
+            data = payload.get("data") or {}
+            items = data.get("items") or []
+            if not items:
+                logging.info("No more dynamic items at page %s", page)
+                return
+
+            oldest_ts_on_page = int(time.time())
+            for item in items:
+                dynamic_id = str(item.get("id_str") or item.get("id") or "")
+                modules = item.get("modules") or {}
+                pub_ts = extract_pub_ts(modules)
+                oldest_ts_on_page = min(oldest_ts_on_page, pub_ts)
+                # 动态发布时间早于 cutoff 时跳过；整页越界后会停止翻页。
+                if pub_ts < cutoff_ts:
+                    logging.debug("Reached old dynamic %s at %s", dynamic_id, format_ts(pub_ts))
+                    continue
+                video = extract_video(item)
+                if video is None:
+                    continue
+                yield video
+
+            has_more = bool(data.get("has_more"))
+            offset = str(data.get("offset") or "")
+            if not has_more or not offset:
+                return
+            # 当前页最早动态已经超过时间窗口，后续页通常更旧，可以停止。
+            if oldest_ts_on_page < cutoff_ts:
+                logging.info("Stop after page %s; oldest item is older than cutoff", page)
+                return
+            time.sleep(self.page_sleep)
+
+    def fetch_follow_group_mids(self, group_names: list[str]) -> set[int] | None:
+        """按关注分组名称拉取分组内所有 UP 主 mid；未配置分组时不限制。"""
+        if not group_names:
+            return None
+        if not self.user_mid.isdigit():
+            raise ValueError("cookie is missing DedeUserID; cannot resolve follow groups")
+
+        payload = self.get_json(RELATION_TAGS_URL, params={})
+        tags = payload.get("data") or []
+        requested_names = set(group_names)
+        tag_ids = {
+            str(tag.get("name")): int(tag.get("tagid"))
+            for tag in tags
+            if str(tag.get("name")) in requested_names and str(tag.get("tagid") or "").lstrip("-").isdigit()
+        }
+        missing_names = sorted(requested_names - set(tag_ids))
+        if missing_names:
+            available = ", ".join(str(tag.get("name")) for tag in tags if tag.get("name"))
+            raise ValueError(f"follow groups not found: {missing_names}; available groups: {available}")
+
+        mids: set[int] = set()
+        group_counts: dict[str, int] = {}
+        for name, tag_id in tag_ids.items():
+            group_mids: set[int] = set()
+            pn = 1
+            while True:
+                payload = self.get_json(
+                    RELATION_TAG_URL,
+                    params={"mid": int(self.user_mid), "tagid": tag_id, "pn": pn, "ps": 50},
+                )
+                data = payload.get("data") or []
+                users = data.get("list", []) if isinstance(data, dict) else data
+                if not users:
+                    break
+                for user in users:
+                    mid = user.get("mid")
+                    if str(mid or "").isdigit():
+                        mids.add(int(mid))
+                        group_mids.add(int(mid))
+                logging.debug("Loaded %s users from follow group %s page %s", len(users), name, pn)
+                if len(users) < 50:
+                    break
+                pn += 1
+                time.sleep(self.page_sleep)
+            group_counts[name] = len(group_mids)
+        group_summary = "  ".join(f"{name}: {group_counts.get(name, 0)}" for name in group_names)
+        logging.info("Resolved %s UPs from follow groups: %s", len(mids), group_summary)
+        return mids
+
+    def fetch_video_info(self, video: DynamicVideo) -> tuple[int, int, int]:
+        params: dict[str, str | int] = {"bvid": video.bvid} if video.bvid else {"aid": video.aid or 0}
+        payload = self.get_json(VIDEO_VIEW_URL, params=params)
+        data = payload["data"]
+        return int(data["aid"]), int(data["duration"]), int(data.get("pubdate") or video.pub_ts)
+
+    def add_to_favorite(self, aid: int) -> None:
+        # 没有 bili_jct 时无法通过 B 站收藏接口的 CSRF 校验。
+        if not self.csrf:
+            raise ValueError("cookie is missing bili_jct; cannot submit favorite request")
+        payload = self.post_json(
+            FAVORITE_DEAL_URL,
+            data={
+                "rid": aid,
+                "type": 2,
+                "add_media_ids": self.media_id,
+                "del_media_ids": "",
+                "csrf": self.csrf,
+            },
+        )
+        # code=0 表示成功；11201 通常表示已经收藏过，按幂等成功处理。
+        code = int(payload.get("code", -1))
+        if code == FAVORITE_FOLDER_FULL_CODE:
+            logging.warning("⚠️⚠️ Favorite folder %s is full; creating and switching to a numbered folder", self.media_id)
+            self.media_id = self.create_numbered_favorite_folder()
+            logging.info("🔗🔗Switched to favorite folder %s", self.media_id)
+            self.add_to_favorite(aid)
+            return
+        if code not in (0, 11201):
+            message = payload.get("message") or payload.get("msg") or payload
+            raise ValueError(f"favorite API failed: {message}")
+
+    def fetch_favorite_folder_title(self) -> str:
+        if self.favorite_folder_title:
+            return self.favorite_folder_title
+        payload = self.get_json(FAVORITE_FOLDER_INFO_URL, params={"media_id": self.original_media_id})
+        data = payload.get("data") or {}
+        title = str(data.get("title") or f"收藏夹{self.original_media_id}").strip()
+        self.favorite_folder_title = title or f"收藏夹{self.original_media_id}"
+        return self.favorite_folder_title
+
+    def create_numbered_favorite_folder(self) -> int:
+        if not self.csrf:
+            raise ValueError("cookie is missing bili_jct; cannot create favorite folder")
+        base_title = strip_numbered_suffix(self.fetch_favorite_folder_title())
+        for index in range(2, 1000):
+            title = f"{base_title} {index}"
+            payload = self.post_json(
+                FAVORITE_FOLDER_ADD_URL,
+                data={"title": title, "privacy": 0, "csrf": self.csrf},
+            )
+            code = int(payload.get("code", -1))
+            if code == 0:
+                data = payload.get("data") or {}
+                media_id = data.get("id") or data.get("media_id")
+                if str(media_id or "").isdigit():
+                    logging.info("Created favorite folder: title=%s media_id=%s", title, media_id)
+                    return int(media_id)
+                raise ValueError(f"favorite folder created but media_id is missing: {payload}")
+            if is_duplicate_folder_error(payload):
+                continue
+            message = payload.get("message") or payload.get("msg") or payload
+            raise ValueError(f"create favorite folder failed: {message}")
+        raise ValueError(f"could not find an available numbered favorite folder name for {base_title}")
+
+    def get_json(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
+        query = urlencode(params)
+        request = Request(f"{url}?{query}", headers=self.headers, method="GET")
+        payload = self.open_json(request)
+        if int(payload.get("code", 0)) != 0:
+            raise BilibiliAPIError(f"GET {url} failed: {payload}")
+        return payload
+
+    def post_json(self, url: str, data: dict[str, Any]) -> dict[str, Any]:
+        body = urlencode(data).encode("utf-8")
+        headers = {**self.headers, "Content-Type": "application/x-www-form-urlencoded"}
+        request = Request(url, data=body, headers=headers, method="POST")
+        return self.open_json(request)
+
+    def open_json(self, request: Request) -> dict[str, Any]:
+        last_error: HTTPError | URLError | BilibiliAPIError | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                with self.opener.open(request, timeout=20) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                last_error = exc
+                if exc.code not in RETRYABLE_HTTP_STATUS or attempt >= self.max_retries:
+                    raise
+                self.sleep_before_retry(attempt, f"HTTP {exc.code}: {format_http_error(exc)}")
+            except URLError as exc:
+                last_error = exc
+                if attempt >= self.max_retries:
+                    raise
+                self.sleep_before_retry(attempt, str(exc))
+            except json.JSONDecodeError as exc:
+                last_error = BilibiliAPIError(f"invalid JSON response: {exc}")
+                if attempt >= self.max_retries:
+                    raise last_error from exc
+                self.sleep_before_retry(attempt, str(last_error))
+        if last_error is not None:
+            raise last_error
+        raise BilibiliAPIError("request failed without an error detail")
+
+    def sleep_before_retry(self, attempt: int, reason: str) -> None:
+        delay = self.retry_sleep * (2 ** attempt) + random.uniform(0, min(1.0, self.retry_sleep))
+        logging.warning("Request failed (%s); retrying in %.1fs", reason, delay)
+        time.sleep(delay)
+
+    def mark_processed(self, bvid: str, status: str, video: DynamicVideo, upload_ts: int) -> None:
+        record = {
+            # updated_at 记录 UP 主视频投稿上传时间，而不是脚本处理时间。
+            "updated_at": format_ts(upload_ts),
+            "bvid": bvid,
+            "status": status,
+            "up_name": video.up_name,
+            "title": video.title,
+        }
+        self.state["processed_bvids"][bvid] = record
+        self.save_state(record)
+
+    def save_state(self, record: dict[str, Any] | None = None) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        if record is None:
+            return
+        with self.state_path.open("a", encoding="utf-8") as state_file:
+            state_file.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def extract_pub_ts(modules: dict[str, Any]) -> int:
+    """从动态模块中提取发布时间戳。"""
+    module_author = modules.get("module_author") or {}
+    return int(module_author.get("pub_ts") or 0)
+
+
+def extract_video(item: dict[str, Any]) -> DynamicVideo | None:
+    """只从动态条目中提取 archive 视频投稿，非视频动态返回 None。"""
+    modules = item.get("modules") or {}
+    major = (modules.get("module_dynamic") or {}).get("major") or {}
+    archive = major.get("archive") or {}
+    if not archive:
+        return None
+
+    bvid = str(archive.get("bvid") or "")
+    aid = archive.get("aid")
+    if not bvid and not aid:
+        return None
+
+    author = modules.get("module_author") or {}
+    title = str(archive.get("title") or "").strip()
+    return DynamicVideo(
+        dynamic_id=str(item.get("id_str") or item.get("id") or ""),
+        bvid=bvid,
+        aid=int(aid) if str(aid or "").isdigit() else None,
+        title=title,
+        pub_ts=extract_pub_ts(modules),
+        up_name=str(author.get("name") or ""),
+        up_mid=int(author.get("mid")) if str(author.get("mid") or "").isdigit() else None,
+    )
+
+
+def load_state(path: Path) -> dict[str, Any]:
+    """读取 JSON Lines 断点状态文件；兼容旧版 JSON 对象状态。"""
+    if not path.exists():
+        return {"processed_bvids": {}}
+
+    content = path.read_text(encoding="utf-8").strip()
+    if not content:
+        return {"processed_bvids": {}}
+
+    processed: dict[str, Any] = {}
+    if content.startswith("{"):
+        try:
+            legacy_state = json.loads(content)
+        except json.JSONDecodeError:
+            legacy_state = None
+        if isinstance(legacy_state, dict) and "processed_bvids" in legacy_state:
+            legacy_processed = legacy_state.get("processed_bvids", {})
+            if isinstance(legacy_processed, dict):
+                processed.update(legacy_processed)
+            return {"processed_bvids": processed}
+
+    for line_no, line in enumerate(content.splitlines(), start=1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        bvid = str(record.get("bvid") or "")
+        if not bvid:
+            raise ValueError(f"state line {line_no} is missing bvid")
+        processed[bvid] = record
+    return {"processed_bvids": processed}
+
+
+def read_cookie_value(cookie_string: str, name: str) -> str:
+    match = re.search(rf"(?:^|;\s*){re.escape(name)}=([^;]+)", cookie_string)
+    return unquote(match.group(1)) if match else ""
+
+
+def parse_follow_groups(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    else:
+        raw_items = []
+        for item in value:
+            raw_items.extend(str(item).split(","))
+    return [item.strip() for item in raw_items if item.strip()]
+
+
+def read_cookie(args: argparse.Namespace) -> str:
+    """按 命令行 > config.py > 环境变量 的顺序读取 Cookie。"""
+    if args.cookie:
+        return args.cookie.strip()
+    cookie_file = args.cookie_file or config.COOKIE_FILE
+    if cookie_file:
+        return Path(cookie_file).read_text(encoding="utf-8").strip()
+    if config.COOKIE:
+        return str(config.COOKIE).strip()
+    cookie = os.environ.get("BILI_COOKIE", "").strip()
+    if cookie:
+        return cookie
+    raise SystemExit("Missing cookie. Set COOKIE in config.py, or use --cookie, --cookie-file, or BILI_COOKIE.")
+
+
+def format_http_error(exc: HTTPError) -> str:
+    """尽量提取 HTTP 错误响应体，方便判断 412/风控等问题。"""
+    detail = ""
+    try:
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+    except (OSError, ValueError):
+        detail = ""
+    if detail:
+        return f"HTTP {exc.code} {exc.reason}: {detail[:300]}"
+    return f"HTTP {exc.code} {exc.reason}"
+
+
+def start_of_date_ts(value: date) -> int:
+    return int(datetime.combine(value, datetime_time.min, tzinfo=timezone.utc).timestamp())
+
+
+def parse_start_date(value: str | date) -> date:
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("date must use YYYY-MM-DD format") from exc
+
+
+def format_ts(timestamp: int) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat()
+
+
+def format_duration(seconds: int) -> str:
+    minutes, second = divmod(max(0, int(seconds)), 60)
+    hours, minute = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minute:02d}:{second:02d}"
+    return f"{minute:02d}:{second:02d}"
+
+
+def strip_numbered_suffix(title: str) -> str:
+    return re.sub(r"\s+\d+$", "", title).strip() or title
+
+
+def is_duplicate_folder_error(payload: dict[str, Any]) -> bool:
+    message = str(payload.get("message") or payload.get("msg") or "")
+    return "存在" in message or "重复" in message or "同名" in message
+
+
+def configure_logging(log_file: Path, verbose: bool) -> None:
+    """同时配置终端日志和文件日志。"""
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(log_file, encoding="utf-8")],
+    )
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Favorite followed-UP video dynamic posts from a start date into a Bilibili favorite folder."
+    )
+    parser.add_argument("--media-id", type=int, default=config.MEDIA_ID, help="Target favorite folder media_id.")
+    parser.add_argument("--cookie", help="Raw Bilibili cookie string copied from a logged-in browser.")
+    parser.add_argument("--cookie-file", help="Path to a text file containing the raw cookie string.")
+    parser.add_argument(
+        "--start-date",
+        type=parse_start_date,
+        default=parse_start_date(config.START_DATE),
+        help="Only process video posts uploaded on or after this date (YYYY-MM-DD).",
+    )
+    parser.add_argument("--min-duration", type=int, default=config.MIN_DURATION, help="Minimum video duration in seconds.")
+    parser.add_argument(
+        "--follow-groups",
+        default=",".join(parse_follow_groups(getattr(config, "FOLLOW_GROUPS", []))),
+        help="Comma-separated followed-UP group names to include, for example: 科技,影视. Empty means all followed UPs.",
+    )
+    parser.add_argument("--state", type=Path, default=Path("data/state.json"), help="Checkpoint JSON path.")
+    parser.add_argument("--log-file", type=Path, default=Path("logs/bili_dynamic_fav.log"), help="Log file path.")
+    parser.add_argument("--page-sleep", type=float, default=2.0, help="Delay between dynamic pages.")
+    parser.add_argument("--action-sleep", type=float, default=3.0, help="Delay between favorite actions.")
+    parser.add_argument("--max-retries", type=int, default=3, help="Retry count for transient HTTP/API failures.")
+    parser.add_argument("--retry-sleep", type=float, default=10.0, help="Base seconds to wait before retrying transient failures.")
+    parser.add_argument("--dry-run", action="store_true", help="Scan and log actions without changing favorites.")
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    configure_logging(args.log_file, args.verbose)
+    if args.media_id is None:
+        raise SystemExit("Missing media_id. Set MEDIA_ID in config.py or pass --media-id.")
+    cookie = read_cookie(args)
+    favoriter = BilibiliDynamicFavoriter(
+        cookie=cookie,
+        media_id=args.media_id,
+        state_path=args.state,
+        start_date=args.start_date,
+        min_duration=args.min_duration,
+        page_sleep=args.page_sleep,
+        action_sleep=args.action_sleep,
+        max_retries=args.max_retries,
+        retry_sleep=args.retry_sleep,
+        dry_run=args.dry_run,
+        follow_groups=parse_follow_groups(args.follow_groups),
+    )
+    stats = favoriter.run()
+    print(json.dumps(stats, ensure_ascii=False, indent=2))
+    return 0 if stats["failed"] == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
