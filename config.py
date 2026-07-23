@@ -16,8 +16,8 @@ COOKIE_FILE = ""
 # 目标收藏夹 media_id。保持 None 时，需要运行时传入 --media-id。
 MEDIA_ID = None
 
-# 只处理最近 N 天内发布的动态。
-DAYS = 30
+# 只处理该日期（含）到当前时间之间上传的视频投稿，格式为 YYYY-MM-DD。
+START_DATE = "2024-01-01"
 
 # 只收藏时长不少于该秒数的视频。
 MIN_DURATION = 60

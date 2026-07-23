@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Collect recent followed Bilibili video dynamics and add videos to a favorite list.
+"""Collect followed Bilibili video dynamics from a configured start date and add videos to a favorite list.
 
 Flow:
-    Bilibili dynamic video tab -> followed dynamic feed -> last N days -> video posts
+    Bilibili dynamic video tab -> followed dynamic feed -> configured start date to now -> video posts
     -> video duration >= minimum seconds -> add to target favorite folder.
 
 Authentication:
@@ -22,7 +22,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timezone
 from pathlib import Path
 from typing import Any
 
@@ -71,7 +71,7 @@ class BilibiliDynamicFavoriter:
         cookie: str,
         media_id: int,
         state_path: Path,
-        days: int,
+        start_date: date,
         min_duration: int,
         page_sleep: float,
         action_sleep: float,
@@ -82,7 +82,7 @@ class BilibiliDynamicFavoriter:
     ) -> None:
         self.media_id = media_id
         self.state_path = state_path
-        self.days = days
+        self.start_date = start_date
         self.min_duration = min_duration
         self.page_sleep = page_sleep
         self.action_sleep = action_sleep
@@ -118,8 +118,8 @@ class BilibiliDynamicFavoriter:
             "favorited": 0,
             "failed": 0,
         }
-        # 以当前时间倒推 days 天作为动态发布时间筛选边界。
-        cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=self.days)).timestamp())
+        # 以指定日期当天 00:00 作为动态发布时间筛选边界，一直扫描到当前最新投稿。
+        cutoff_ts = start_of_date_ts(self.start_date)
         logging.info("Start scanning followed video dynamics since %s", format_ts(cutoff_ts))
         allowed_up_mids = self.fetch_follow_group_mids(self.follow_groups)
 
@@ -147,7 +147,7 @@ class BilibiliDynamicFavoriter:
 
             try:
                 # 动态卡片里的信息不一定完整，先查询视频详情确认 aid 与时长。
-                aid, duration = self.fetch_video_info(video)
+                aid, duration, upload_ts = self.fetch_video_info(video)
                 if duration < self.min_duration:
                     stats["skipped_short"] += 1
                     logging.info(
@@ -156,7 +156,7 @@ class BilibiliDynamicFavoriter:
                         duration,
                         video.title,
                     )
-                    self.mark_processed(dedupe_key, "short")
+                    self.mark_processed(dedupe_key, "short", video, upload_ts)
                     continue
 
                 if self.dry_run:
@@ -179,7 +179,7 @@ class BilibiliDynamicFavoriter:
                         video.title,
                     )
                 stats["favorited"] += 1
-                self.mark_processed(dedupe_key, "favorited" if not self.dry_run else "dry_run")
+                self.mark_processed(dedupe_key, "favorited" if not self.dry_run else "dry_run", video, upload_ts)
                 time.sleep(self.action_sleep)
             except HTTPError as exc:
                 stats["failed"] += 1
@@ -280,11 +280,11 @@ class BilibiliDynamicFavoriter:
         logging.info("Resolved %s UPs from follow groups: %s", len(mids), ", ".join(group_names))
         return mids
 
-    def fetch_video_info(self, video: DynamicVideo) -> tuple[int, int]:
+    def fetch_video_info(self, video: DynamicVideo) -> tuple[int, int, int]:
         params: dict[str, str | int] = {"bvid": video.bvid} if video.bvid else {"aid": video.aid or 0}
         payload = self.get_json(VIDEO_VIEW_URL, params=params)
         data = payload["data"]
-        return int(data["aid"]), int(data["duration"])
+        return int(data["aid"]), int(data["duration"]), int(data.get("pubdate") or video.pub_ts)
 
     def add_to_favorite(self, aid: int) -> None:
         # 没有 bili_jct 时无法通过 B 站收藏接口的 CSRF 校验。
@@ -349,19 +349,26 @@ class BilibiliDynamicFavoriter:
         logging.warning("Request failed (%s); retrying in %.1fs", reason, delay)
         time.sleep(delay)
 
-    def mark_processed(self, bvid: str, status: str) -> None:
-        self.state["processed_bvids"][bvid] = {
+    def mark_processed(self, bvid: str, status: str, video: DynamicVideo, upload_ts: int) -> None:
+        record = {
+            "bvid": bvid,
             "status": status,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            # updated_at 记录 UP 主视频投稿上传时间，而不是脚本处理时间。
+            "updated_at": format_ts(upload_ts),
+            "dynamic_id": video.dynamic_id,
+            "title": video.title,
+            "up_name": video.up_name,
+            "up_mid": video.up_mid,
         }
-        self.save_state()
+        self.state["processed_bvids"][bvid] = record
+        self.save_state(record)
 
-    def save_state(self) -> None:
+    def save_state(self, record: dict[str, Any] | None = None) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        # 先写临时文件再替换，降低中途退出导致状态文件损坏的概率。
-        tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp_path.replace(self.state_path)
+        if record is None:
+            return
+        with self.state_path.open("a", encoding="utf-8") as state_file:
+            state_file.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 def extract_pub_ts(modules: dict[str, Any]) -> int:
@@ -397,12 +404,35 @@ def extract_video(item: dict[str, Any]) -> DynamicVideo | None:
 
 
 def load_state(path: Path) -> dict[str, Any]:
-    """读取断点状态文件；不存在时返回空状态。"""
+    """读取 JSON Lines 断点状态文件；兼容旧版 JSON 对象状态。"""
     if not path.exists():
         return {"processed_bvids": {}}
-    state = json.loads(path.read_text(encoding="utf-8"))
-    state.setdefault("processed_bvids", {})
-    return state
+
+    content = path.read_text(encoding="utf-8").strip()
+    if not content:
+        return {"processed_bvids": {}}
+
+    processed: dict[str, Any] = {}
+    if content.startswith("{"):
+        try:
+            legacy_state = json.loads(content)
+        except json.JSONDecodeError:
+            legacy_state = None
+        if isinstance(legacy_state, dict) and "processed_bvids" in legacy_state:
+            legacy_processed = legacy_state.get("processed_bvids", {})
+            if isinstance(legacy_processed, dict):
+                processed.update(legacy_processed)
+            return {"processed_bvids": processed}
+
+    for line_no, line in enumerate(content.splitlines(), start=1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        bvid = str(record.get("bvid") or "")
+        if not bvid:
+            raise ValueError(f"state line {line_no} is missing bvid")
+        processed[bvid] = record
+    return {"processed_bvids": processed}
 
 
 def read_cookie_value(cookie_string: str, name: str) -> str:
@@ -449,6 +479,19 @@ def format_http_error(exc: HTTPError) -> str:
     return f"HTTP {exc.code} {exc.reason}"
 
 
+def start_of_date_ts(value: date) -> int:
+    return int(datetime.combine(value, datetime_time.min, tzinfo=timezone.utc).timestamp())
+
+
+def parse_start_date(value: str | date) -> date:
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("date must use YYYY-MM-DD format") from exc
+
+
 def format_ts(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat()
 
@@ -466,12 +509,17 @@ def configure_logging(log_file: Path, verbose: bool) -> None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Favorite recent followed-UP video dynamic posts into a Bilibili favorite folder."
+        description="Favorite followed-UP video dynamic posts from a start date into a Bilibili favorite folder."
     )
     parser.add_argument("--media-id", type=int, default=config.MEDIA_ID, help="Target favorite folder media_id.")
     parser.add_argument("--cookie", help="Raw Bilibili cookie string copied from a logged-in browser.")
     parser.add_argument("--cookie-file", help="Path to a text file containing the raw cookie string.")
-    parser.add_argument("--days", type=int, default=config.DAYS, help="Only process dynamics in the latest N days.")
+    parser.add_argument(
+        "--start-date",
+        type=parse_start_date,
+        default=parse_start_date(config.START_DATE),
+        help="Only process video posts uploaded on or after this date (YYYY-MM-DD).",
+    )
     parser.add_argument("--min-duration", type=int, default=config.MIN_DURATION, help="Minimum video duration in seconds.")
     parser.add_argument(
         "--follow-groups",
@@ -499,7 +547,7 @@ def main(argv: list[str] | None = None) -> int:
         cookie=cookie,
         media_id=args.media_id,
         state_path=args.state,
-        days=args.days,
+        start_date=args.start_date,
         min_duration=args.min_duration,
         page_sleep=args.page_sleep,
         action_sleep=args.action_sleep,

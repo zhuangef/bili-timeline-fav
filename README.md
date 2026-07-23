@@ -1,6 +1,6 @@
 # B 站动态视频收藏脚本
 
-`bili_dynamic_fav.py` 用于从 B 站“动态 → 视频投稿”页面对应的关注动态流中抓取已关注 UP 主的视频投稿：默认只处理最近 30 天内发布的动态，只保留视频时长不少于 60 秒的投稿；也可以限制只处理指定关注分组（例如“科技”“影视”）中的 UP 主视频，并自动按发布时间从早到晚收藏到指定收藏夹。
+`bili_dynamic_fav.py` 用于从 B 站“动态 → 视频投稿”页面对应的关注动态流中抓取已关注 UP 主的视频投稿：默认只处理指定日期（含）到现在上传的视频投稿，只保留视频时长不少于 60 秒的投稿；也可以限制只处理指定关注分组（例如“科技”“影视”）中的 UP 主视频，并自动按发布时间从早到晚收藏到指定收藏夹。
 
 脚本支持断点续跑、去重、运行日志和 dry-run 预演模式，适合手动执行或配合定时任务长期运行。
 
@@ -11,7 +11,7 @@ B站 → 动态 → 视频投稿（https://t.bilibili.com/?tab=video）
 ↓
 获取关注动态流
 ↓
-按动态时间筛选最近 30 天
+按上传时间筛选指定日期（含）到现在的视频投稿
 ↓
 只保留视频投稿
 ↓
@@ -63,12 +63,12 @@ python -m pip install -r requirements.txt
 COOKIE = "SESSDATA=...; bili_jct=...; DedeUserID=..."
 COOKIE_FILE = ""
 MEDIA_ID = 123456
-DAYS = 30
+START_DATE = "2024-01-01"
 MIN_DURATION = 60
 FOLLOW_GROUPS = ["科技", "影视"]
 ```
 
-这些配置分别对应 Cookie、Cookie 文件路径、目标收藏夹 `media_id`、视频筛选日期范围、视频时长筛选阈值和允许的关注分组。`FOLLOW_GROUPS` 留空时表示不限制关注分组；填写后脚本只会收藏这些分组内 UP 主的视频。命令行参数优先级更高；也就是说，运行时传入 `--media-id`、`--days`、`--min-duration` 或 `--follow-groups` 会覆盖 `config.py` 中的值。
+这些配置分别对应 Cookie、Cookie 文件路径、目标收藏夹 `media_id`、视频筛选起始日期、视频时长筛选阈值和允许的关注分组。`FOLLOW_GROUPS` 留空时表示不限制关注分组；填写后脚本只会收藏这些分组内 UP 主的视频。命令行参数优先级更高；也就是说，运行时传入 `--media-id`、`--start-date`、`--min-duration` 或 `--follow-groups` 会覆盖 `config.py` 中的值。
 
 > 注意：真实 Cookie 是登录凭证。如果仓库会推送到远端或共享给他人，请不要把真实 Cookie 写入已提交的文件中，建议改用 `COOKIE_FILE` 或 `BILI_COOKIE` 环境变量。
 
@@ -84,7 +84,7 @@ python bili_dynamic_fav.py
 
 ```bash
 export BILI_COOKIE='SESSDATA=...; bili_jct=...; DedeUserID=...'
-python bili_dynamic_fav.py --media-id 123456 --days 30 --min-duration 60 --follow-groups 科技,影视
+python bili_dynamic_fav.py --media-id 123456 --start-date 2024-01-01 --min-duration 60 --follow-groups 科技,影视
 ```
 
 也可以把 Cookie 放到本地文本文件中，再通过参数读取：
@@ -93,7 +93,7 @@ python bili_dynamic_fav.py --media-id 123456 --days 30 --min-duration 60 --follo
 python bili_dynamic_fav.py \
   --cookie-file ./cookie.txt \
   --media-id 123456 \
-  --days 30 \
+  --start-date 2024-01-01 \
   --min-duration 60 \
   --follow-groups 科技,影视
 ```
@@ -111,7 +111,7 @@ python bili_dynamic_fav.py --media-id 123456 --dry-run
 | `--media-id` | `config.py` 中的 `MEDIA_ID` | 目标收藏夹 ID。 |
 | `--cookie` | 无 | 直接传入完整 Cookie 字符串。 |
 | `--cookie-file` | 无 | 从文件读取完整 Cookie 字符串。 |
-| `--days` | `config.py` 中的 `DAYS`，初始为 `30` | 只处理最近 N 天内的动态。 |
+| `--start-date` | `config.py` 中的 `START_DATE`，初始为 `2024-01-01` | 只处理该日期（含）到现在上传的视频投稿，格式为 `YYYY-MM-DD`。 |
 | `--min-duration` | `config.py` 中的 `MIN_DURATION`，初始为 `60` | 只收藏时长不少于 N 秒的视频。 |
 | `--follow-groups` | `config.py` 中的 `FOLLOW_GROUPS`，初始为空 | 逗号分隔的关注分组名称；留空表示处理全部已关注 UP。 |
 | `--state` | `data/state.json` | 断点续跑和去重状态文件。 |
@@ -143,9 +143,9 @@ python bili_dynamic_fav.py --media-id 123456 --dry-run
 
 ## 断点续跑与去重
 
-脚本会把已处理的视频写入 `--state` 指定的 JSON 文件中，默认路径是 `data/state.json`。每处理完一个视频都会立即写入状态，因此中途退出、网络失败或下次重新运行时，脚本会跳过已经处理过的视频。脚本会先收集时间窗口内的视频并按发布时间从早到晚排序，所以实际收藏顺序会从较早发布的视频开始。
+脚本会把已处理的视频逐行写入 `--state` 指定的 JSON Lines 状态文件中（默认路径仍是 `data/state.json`，但每条视频是一行 JSON）。每处理完一个视频都会立即追加一行状态，因此中途退出、网络失败或下次重新运行时，脚本会跳过已经处理过的视频。脚本会先收集起始日期到现在的视频并按发布时间从早到晚排序，所以实际收藏顺序会从较早发布的视频开始。
 
-状态文件中会记录视频处理结果，例如：
+状态文件中每行会记录一条视频的处理结果，`updated_at` 为 UP 主视频投稿上传时间，例如：
 
 - `favorited`：已收藏。
 - `dry_run`：预演模式下命中。
