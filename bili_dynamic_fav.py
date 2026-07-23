@@ -38,6 +38,9 @@ DYNAMIC_FEED_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all"
 VIDEO_VIEW_URL = "https://api.bilibili.com/x/web-interface/view"
 # 收藏操作接口：用于把视频添加到指定收藏夹。
 FAVORITE_DEAL_URL = "https://api.bilibili.com/x/v3/fav/resource/deal"
+# 关注分组接口：用于按关注分组名称解析该分组下的 UP 主。
+RELATION_TAGS_URL = "https://api.bilibili.com/x/relation/tags"
+RELATION_TAG_URL = "https://api.bilibili.com/x/relation/tag"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -58,6 +61,7 @@ class DynamicVideo:
     title: str
     pub_ts: int
     up_name: str
+    up_mid: int | None
 
 
 class BilibiliDynamicFavoriter:
@@ -74,6 +78,7 @@ class BilibiliDynamicFavoriter:
         max_retries: int,
         retry_sleep: float,
         dry_run: bool,
+        follow_groups: list[str],
     ) -> None:
         self.media_id = media_id
         self.state_path = state_path
@@ -84,7 +89,9 @@ class BilibiliDynamicFavoriter:
         self.max_retries = max_retries
         self.retry_sleep = retry_sleep
         self.dry_run = dry_run
+        self.follow_groups = follow_groups
         self.cookie = cookie
+        self.user_mid = read_cookie_value(cookie, "DedeUserID")
         self.opener = build_opener()
         self.headers = {
             "User-Agent": DEFAULT_USER_AGENT,
@@ -107,15 +114,30 @@ class BilibiliDynamicFavoriter:
             "skipped_processed": 0,
             "skipped_old": 0,
             "skipped_short": 0,
+            "skipped_group": 0,
             "favorited": 0,
             "failed": 0,
         }
         # 以当前时间倒推 days 天作为动态发布时间筛选边界。
         cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=self.days)).timestamp())
         logging.info("Start scanning followed video dynamics since %s", format_ts(cutoff_ts))
+        allowed_up_mids = self.fetch_follow_group_mids(self.follow_groups)
 
-        for video in self.iter_recent_video_dynamics(cutoff_ts):
+        videos = sorted(self.iter_recent_video_dynamics(cutoff_ts), key=lambda item: item.pub_ts)
+        logging.info("Collected %s recent video dynamics; processing from oldest to newest", len(videos))
+
+        for video in videos:
             stats["candidate_video"] += 1
+            if allowed_up_mids is not None and video.up_mid not in allowed_up_mids:
+                stats["skipped_group"] += 1
+                logging.info(
+                    "Skip out-of-group UP: mid=%s up=%s bvid=%s title=%s",
+                    video.up_mid,
+                    video.up_name,
+                    video.bvid,
+                    video.title,
+                )
+                continue
             # 使用 bvid 优先作为去重键；没有 bvid 时退回 aid。
             dedupe_key = video.bvid or str(video.aid)
             if dedupe_key in self.state["processed_bvids"]:
@@ -213,6 +235,50 @@ class BilibiliDynamicFavoriter:
                 logging.info("Stop after page %s; oldest item is older than cutoff", page)
                 return
             time.sleep(self.page_sleep)
+
+    def fetch_follow_group_mids(self, group_names: list[str]) -> set[int] | None:
+        """按关注分组名称拉取分组内所有 UP 主 mid；未配置分组时不限制。"""
+        if not group_names:
+            return None
+        if not self.user_mid.isdigit():
+            raise ValueError("cookie is missing DedeUserID; cannot resolve follow groups")
+
+        payload = self.get_json(RELATION_TAGS_URL, params={})
+        tags = payload.get("data") or []
+        requested_names = set(group_names)
+        tag_ids = {
+            str(tag.get("name")): int(tag.get("tagid"))
+            for tag in tags
+            if str(tag.get("name")) in requested_names and str(tag.get("tagid") or "").lstrip("-").isdigit()
+        }
+        missing_names = sorted(requested_names - set(tag_ids))
+        if missing_names:
+            available = ", ".join(str(tag.get("name")) for tag in tags if tag.get("name"))
+            raise ValueError(f"follow groups not found: {missing_names}; available groups: {available}")
+
+        mids: set[int] = set()
+        for name, tag_id in tag_ids.items():
+            pn = 1
+            while True:
+                payload = self.get_json(
+                    RELATION_TAG_URL,
+                    params={"mid": int(self.user_mid), "tagid": tag_id, "pn": pn, "ps": 50},
+                )
+                data = payload.get("data") or []
+                users = data.get("list", []) if isinstance(data, dict) else data
+                if not users:
+                    break
+                for user in users:
+                    mid = user.get("mid")
+                    if str(mid or "").isdigit():
+                        mids.add(int(mid))
+                logging.debug("Loaded %s users from follow group %s page %s", len(users), name, pn)
+                if len(users) < 50:
+                    break
+                pn += 1
+                time.sleep(self.page_sleep)
+        logging.info("Resolved %s UPs from follow groups: %s", len(mids), ", ".join(group_names))
+        return mids
 
     def fetch_video_info(self, video: DynamicVideo) -> tuple[int, int]:
         params: dict[str, str | int] = {"bvid": video.bvid} if video.bvid else {"aid": video.aid or 0}
@@ -326,6 +392,7 @@ def extract_video(item: dict[str, Any]) -> DynamicVideo | None:
         title=title,
         pub_ts=extract_pub_ts(modules),
         up_name=str(author.get("name") or ""),
+        up_mid=int(author.get("mid")) if str(author.get("mid") or "").isdigit() else None,
     )
 
 
@@ -341,6 +408,18 @@ def load_state(path: Path) -> dict[str, Any]:
 def read_cookie_value(cookie_string: str, name: str) -> str:
     match = re.search(rf"(?:^|;\s*){re.escape(name)}=([^;]+)", cookie_string)
     return unquote(match.group(1)) if match else ""
+
+
+def parse_follow_groups(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = value.split(",")
+    else:
+        raw_items = []
+        for item in value:
+            raw_items.extend(str(item).split(","))
+    return [item.strip() for item in raw_items if item.strip()]
 
 
 def read_cookie(args: argparse.Namespace) -> str:
@@ -394,6 +473,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--cookie-file", help="Path to a text file containing the raw cookie string.")
     parser.add_argument("--days", type=int, default=config.DAYS, help="Only process dynamics in the latest N days.")
     parser.add_argument("--min-duration", type=int, default=config.MIN_DURATION, help="Minimum video duration in seconds.")
+    parser.add_argument(
+        "--follow-groups",
+        default=",".join(parse_follow_groups(getattr(config, "FOLLOW_GROUPS", []))),
+        help="Comma-separated followed-UP group names to include, for example: 科技,影视. Empty means all followed UPs.",
+    )
     parser.add_argument("--state", type=Path, default=Path("data/state.json"), help="Checkpoint JSON path.")
     parser.add_argument("--log-file", type=Path, default=Path("logs/bili_dynamic_fav.log"), help="Log file path.")
     parser.add_argument("--page-sleep", type=float, default=2.0, help="Delay between dynamic pages.")
@@ -422,6 +506,7 @@ def main(argv: list[str] | None = None) -> int:
         max_retries=args.max_retries,
         retry_sleep=args.retry_sleep,
         dry_run=args.dry_run,
+        follow_groups=parse_follow_groups(args.follow_groups),
     )
     stats = favoriter.run()
     print(json.dumps(stats, ensure_ascii=False, indent=2))
