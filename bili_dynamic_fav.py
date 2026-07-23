@@ -17,6 +17,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -25,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, unquote
 from urllib.request import Request, build_opener
 
@@ -41,6 +42,11 @@ DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
+RETRYABLE_HTTP_STATUS = {412, 429, 500, 502, 503, 504}
+
+
+class BilibiliAPIError(RuntimeError):
+    """B 站接口返回非成功响应。"""
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,8 @@ class BilibiliDynamicFavoriter:
         min_duration: int,
         page_sleep: float,
         action_sleep: float,
+        max_retries: int,
+        retry_sleep: float,
         dry_run: bool,
     ) -> None:
         self.media_id = media_id
@@ -73,6 +81,8 @@ class BilibiliDynamicFavoriter:
         self.min_duration = min_duration
         self.page_sleep = page_sleep
         self.action_sleep = action_sleep
+        self.max_retries = max_retries
+        self.retry_sleep = retry_sleep
         self.dry_run = dry_run
         self.cookie = cookie
         self.opener = build_opener()
@@ -81,6 +91,9 @@ class BilibiliDynamicFavoriter:
             "Referer": "https://t.bilibili.com/?tab=video",
             "Origin": "https://www.bilibili.com",
             "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Connection": "keep-alive",
+            "X-Requested-With": "XMLHttpRequest",
             "Cookie": cookie,
         }
         # B 站收藏接口需要 bili_jct 作为 CSRF token。
@@ -148,7 +161,10 @@ class BilibiliDynamicFavoriter:
                 time.sleep(self.action_sleep)
             except HTTPError as exc:
                 stats["failed"] += 1
-                logging.exception("HTTP failure for %s: %s", video.bvid, exc)
+                logging.error("HTTP failure for %s after retries: %s", video.bvid, format_http_error(exc))
+            except (BilibiliAPIError, URLError) as exc:
+                stats["failed"] += 1
+                logging.error("API/network failure for %s after retries: %s", video.bvid, exc)
             except (KeyError, TypeError, ValueError) as exc:
                 stats["failed"] += 1
                 logging.exception("Parse failure for %s: %s", video.bvid, exc)
@@ -226,18 +242,46 @@ class BilibiliDynamicFavoriter:
     def get_json(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
         query = urlencode(params)
         request = Request(f"{url}?{query}", headers=self.headers, method="GET")
-        with self.opener.open(request, timeout=20) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        payload = self.open_json(request)
         if int(payload.get("code", 0)) != 0:
-            raise ValueError(f"GET {url} failed: {payload}")
+            raise BilibiliAPIError(f"GET {url} failed: {payload}")
         return payload
 
     def post_json(self, url: str, data: dict[str, Any]) -> dict[str, Any]:
         body = urlencode(data).encode("utf-8")
         headers = {**self.headers, "Content-Type": "application/x-www-form-urlencoded"}
         request = Request(url, data=body, headers=headers, method="POST")
-        with self.opener.open(request, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8"))
+        return self.open_json(request)
+
+    def open_json(self, request: Request) -> dict[str, Any]:
+        last_error: HTTPError | URLError | BilibiliAPIError | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                with self.opener.open(request, timeout=20) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                last_error = exc
+                if exc.code not in RETRYABLE_HTTP_STATUS or attempt >= self.max_retries:
+                    raise
+                self.sleep_before_retry(attempt, f"HTTP {exc.code}: {format_http_error(exc)}")
+            except URLError as exc:
+                last_error = exc
+                if attempt >= self.max_retries:
+                    raise
+                self.sleep_before_retry(attempt, str(exc))
+            except json.JSONDecodeError as exc:
+                last_error = BilibiliAPIError(f"invalid JSON response: {exc}")
+                if attempt >= self.max_retries:
+                    raise last_error from exc
+                self.sleep_before_retry(attempt, str(last_error))
+        if last_error is not None:
+            raise last_error
+        raise BilibiliAPIError("request failed without an error detail")
+
+    def sleep_before_retry(self, attempt: int, reason: str) -> None:
+        delay = self.retry_sleep * (2 ** attempt) + random.uniform(0, min(1.0, self.retry_sleep))
+        logging.warning("Request failed (%s); retrying in %.1fs", reason, delay)
+        time.sleep(delay)
 
     def mark_processed(self, bvid: str, status: str) -> None:
         self.state["processed_bvids"][bvid] = {
@@ -314,6 +358,18 @@ def read_cookie(args: argparse.Namespace) -> str:
     raise SystemExit("Missing cookie. Set COOKIE in config.py, or use --cookie, --cookie-file, or BILI_COOKIE.")
 
 
+def format_http_error(exc: HTTPError) -> str:
+    """尽量提取 HTTP 错误响应体，方便判断 412/风控等问题。"""
+    detail = ""
+    try:
+        detail = exc.read().decode("utf-8", errors="replace").strip()
+    except (OSError, ValueError):
+        detail = ""
+    if detail:
+        return f"HTTP {exc.code} {exc.reason}: {detail[:300]}"
+    return f"HTTP {exc.code} {exc.reason}"
+
+
 def format_ts(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat()
 
@@ -340,8 +396,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--min-duration", type=int, default=config.MIN_DURATION, help="Minimum video duration in seconds.")
     parser.add_argument("--state", type=Path, default=Path("data/state.json"), help="Checkpoint JSON path.")
     parser.add_argument("--log-file", type=Path, default=Path("logs/bili_dynamic_fav.log"), help="Log file path.")
-    parser.add_argument("--page-sleep", type=float, default=1.0, help="Delay between dynamic pages.")
-    parser.add_argument("--action-sleep", type=float, default=0.8, help="Delay between favorite actions.")
+    parser.add_argument("--page-sleep", type=float, default=2.0, help="Delay between dynamic pages.")
+    parser.add_argument("--action-sleep", type=float, default=3.0, help="Delay between favorite actions.")
+    parser.add_argument("--max-retries", type=int, default=3, help="Retry count for transient HTTP/API failures.")
+    parser.add_argument("--retry-sleep", type=float, default=10.0, help="Base seconds to wait before retrying transient failures.")
     parser.add_argument("--dry-run", action="store_true", help="Scan and log actions without changing favorites.")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     return parser.parse_args(argv)
@@ -361,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
         min_duration=args.min_duration,
         page_sleep=args.page_sleep,
         action_sleep=args.action_sleep,
+        max_retries=args.max_retries,
+        retry_sleep=args.retry_sleep,
         dry_run=args.dry_run,
     )
     stats = favoriter.run()

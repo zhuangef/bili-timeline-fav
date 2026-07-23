@@ -109,10 +109,30 @@ python bili_dynamic_fav.py --media-id 123456 --dry-run
 | `--min-duration` | `config.py` 中的 `MIN_DURATION`，初始为 `60` | 只收藏时长不少于 N 秒的视频。 |
 | `--state` | `data/state.json` | 断点续跑和去重状态文件。 |
 | `--log-file` | `logs/bili_dynamic_fav.log` | 运行日志文件。 |
-| `--page-sleep` | `1.0` | 动态分页请求之间的等待秒数。 |
-| `--action-sleep` | `0.8` | 每次收藏操作之间的等待秒数。 |
+| `--page-sleep` | `2.0` | 动态分页请求之间的等待秒数。 |
+| `--action-sleep` | `3.0` | 每次收藏操作之间的等待秒数。 |
+| `--max-retries` | `3` | 对 412、429、5xx 等临时 HTTP 失败的重试次数。 |
+| `--retry-sleep` | `10.0` | 临时失败重试前的基础等待秒数；多次失败会指数退避。 |
 | `--dry-run` | 关闭 | 只扫描和记录日志，不执行收藏。 |
 | `--verbose` | 关闭 | 输出更详细的调试日志。 |
+
+## HTTP 412 / 风控处理
+
+`HTTP Error 412: Precondition Failed` 通常不是脚本解析错误，而是 B 站侧的风控或反爬响应：例如短时间连续收藏过多、Cookie 登录态不完整/过期、请求头与浏览器环境差异较大，或当前 IP/账号触发了临时校验。
+
+脚本已针对这类临时失败做了以下处理：
+
+- 为请求补充更接近浏览器 AJAX 请求的常见请求头。
+- 默认把分页间隔调高到 2 秒、收藏间隔调高到 3 秒。
+- 对 `412`、`429` 和常见 `5xx` 错误自动重试，默认最多重试 3 次，并使用指数退避等待。
+- 日志会尽量打印 HTTP 错误响应体，便于判断是风控、Cookie 失效还是接口参数问题。
+
+如果仍然频繁出现 412，建议：
+
+1. 停止脚本一段时间后再运行，避免继续触发风控。
+2. 从已登录浏览器重新复制完整 Cookie，确认包含 `SESSDATA`、`DedeUserID`、`bili_jct`，最好也包含 `buvid3`、`b_nut` 等浏览器生成的标识 Cookie。
+3. 进一步放慢请求，例如：`python bili_dynamic_fav.py --action-sleep 8 --page-sleep 5 --retry-sleep 30`。
+4. 避免多实例同时运行同一个账号，或在短时间内批量收藏大量视频。
 
 ## 断点续跑与去重
 
