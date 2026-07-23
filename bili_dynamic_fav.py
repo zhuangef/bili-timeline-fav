@@ -38,6 +38,11 @@ DYNAMIC_FEED_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all"
 VIDEO_VIEW_URL = "https://api.bilibili.com/x/web-interface/view"
 # 收藏操作接口：用于把视频添加到指定收藏夹。
 FAVORITE_DEAL_URL = "https://api.bilibili.com/x/v3/fav/resource/deal"
+# 收藏夹详情接口：用于读取当前收藏夹名称。
+FAVORITE_FOLDER_INFO_URL = "https://api.bilibili.com/x/v3/fav/folder/info"
+# 收藏夹新建接口：用于目标收藏夹已满时自动切换到新收藏夹。
+FAVORITE_FOLDER_ADD_URL = "https://api.bilibili.com/x/v3/fav/folder/add"
+FAVORITE_FOLDER_FULL_CODE = 11211
 # 关注分组接口：用于按关注分组名称解析该分组下的 UP 主。
 RELATION_TAGS_URL = "https://api.bilibili.com/x/relation/tags"
 RELATION_TAG_URL = "https://api.bilibili.com/x/relation/tag"
@@ -105,6 +110,8 @@ class BilibiliDynamicFavoriter:
         }
         # B 站收藏接口需要 bili_jct 作为 CSRF token。
         self.csrf = read_cookie_value(cookie, "bili_jct")
+        self.original_media_id = media_id
+        self.favorite_folder_title: str | None = None
         self.state = load_state(state_path)
 
     def run(self) -> dict[str, int]:
@@ -151,9 +158,10 @@ class BilibiliDynamicFavoriter:
                 if duration < self.min_duration:
                     stats["skipped_short"] += 1
                     logging.info(
-                        "Skip short video: %s duration=%ss title=%s",
+                        "short:  bvid=%s duration=%s up=%s title=%s",
                         video.bvid,
-                        duration,
+                        format_duration(duration),
+                        video.up_name,
                         video.title,
                     )
                     self.mark_processed(dedupe_key, "short", video, upload_ts)
@@ -161,20 +169,19 @@ class BilibiliDynamicFavoriter:
 
                 if self.dry_run:
                     logging.info(
-                        "Dry-run favorite: aid=%s bvid=%s duration=%ss title=%s",
-                        aid,
+                        "dry_run:  bvid=%s duration=%s up=%s title=%s",
                         video.bvid,
-                        duration,
+                        format_duration(duration),
+                        video.up_name,
                         video.title,
                     )
                 else:
                     # 只有通过时间窗口、视频类型和时长筛选后才真正收藏。
                     self.add_to_favorite(aid)
                     logging.info(
-                        "Favorited: aid=%s bvid=%s duration=%ss up=%s title=%s",
-                        aid,
+                        "favorited:  bvid=%s duration=%s up=%s title=%s",
                         video.bvid,
-                        duration,
+                        format_duration(duration),
                         video.up_name,
                         video.title,
                     )
@@ -257,7 +264,9 @@ class BilibiliDynamicFavoriter:
             raise ValueError(f"follow groups not found: {missing_names}; available groups: {available}")
 
         mids: set[int] = set()
+        group_counts: dict[str, int] = {}
         for name, tag_id in tag_ids.items():
+            group_mids: set[int] = set()
             pn = 1
             while True:
                 payload = self.get_json(
@@ -272,12 +281,15 @@ class BilibiliDynamicFavoriter:
                     mid = user.get("mid")
                     if str(mid or "").isdigit():
                         mids.add(int(mid))
+                        group_mids.add(int(mid))
                 logging.debug("Loaded %s users from follow group %s page %s", len(users), name, pn)
                 if len(users) < 50:
                     break
                 pn += 1
                 time.sleep(self.page_sleep)
-        logging.info("Resolved %s UPs from follow groups: %s", len(mids), ", ".join(group_names))
+            group_counts[name] = len(group_mids)
+        group_summary = "  ".join(f"{name}: {group_counts.get(name, 0)}" for name in group_names)
+        logging.info("Resolved %s UPs from follow groups: %s", len(mids), group_summary)
         return mids
 
     def fetch_video_info(self, video: DynamicVideo) -> tuple[int, int, int]:
@@ -302,8 +314,48 @@ class BilibiliDynamicFavoriter:
         )
         # code=0 表示成功；11201 通常表示已经收藏过，按幂等成功处理。
         code = int(payload.get("code", -1))
+        if code == FAVORITE_FOLDER_FULL_CODE:
+            logging.warning("Favorite folder %s is full; creating and switching to a numbered folder", self.media_id)
+            self.media_id = self.create_numbered_favorite_folder()
+            logging.info("Switched to favorite folder %s", self.media_id)
+            self.add_to_favorite(aid)
+            return
         if code not in (0, 11201):
-            raise ValueError(f"favorite API failed: {payload}")
+            message = payload.get("message") or payload.get("msg") or payload
+            raise ValueError(f"favorite API failed: {message}")
+
+    def fetch_favorite_folder_title(self) -> str:
+        if self.favorite_folder_title:
+            return self.favorite_folder_title
+        payload = self.get_json(FAVORITE_FOLDER_INFO_URL, params={"media_id": self.original_media_id})
+        data = payload.get("data") or {}
+        title = str(data.get("title") or f"收藏夹{self.original_media_id}").strip()
+        self.favorite_folder_title = title or f"收藏夹{self.original_media_id}"
+        return self.favorite_folder_title
+
+    def create_numbered_favorite_folder(self) -> int:
+        if not self.csrf:
+            raise ValueError("cookie is missing bili_jct; cannot create favorite folder")
+        base_title = strip_numbered_suffix(self.fetch_favorite_folder_title())
+        for index in range(2, 1000):
+            title = f"{base_title} {index}"
+            payload = self.post_json(
+                FAVORITE_FOLDER_ADD_URL,
+                data={"title": title, "privacy": 0, "csrf": self.csrf},
+            )
+            code = int(payload.get("code", -1))
+            if code == 0:
+                data = payload.get("data") or {}
+                media_id = data.get("id") or data.get("media_id")
+                if str(media_id or "").isdigit():
+                    logging.info("Created favorite folder: title=%s media_id=%s", title, media_id)
+                    return int(media_id)
+                raise ValueError(f"favorite folder created but media_id is missing: {payload}")
+            if is_duplicate_folder_error(payload):
+                continue
+            message = payload.get("message") or payload.get("msg") or payload
+            raise ValueError(f"create favorite folder failed: {message}")
+        raise ValueError(f"could not find an available numbered favorite folder name for {base_title}")
 
     def get_json(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
         query = urlencode(params)
@@ -351,14 +403,12 @@ class BilibiliDynamicFavoriter:
 
     def mark_processed(self, bvid: str, status: str, video: DynamicVideo, upload_ts: int) -> None:
         record = {
-            "bvid": bvid,
-            "status": status,
             # updated_at 记录 UP 主视频投稿上传时间，而不是脚本处理时间。
             "updated_at": format_ts(upload_ts),
-            "dynamic_id": video.dynamic_id,
-            "title": video.title,
+            "bvid": bvid,
+            "status": status,
             "up_name": video.up_name,
-            "up_mid": video.up_mid,
+            "title": video.title,
         }
         self.state["processed_bvids"][bvid] = record
         self.save_state(record)
@@ -494,6 +544,23 @@ def parse_start_date(value: str | date) -> date:
 
 def format_ts(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone().isoformat()
+
+
+def format_duration(seconds: int) -> str:
+    minutes, second = divmod(max(0, int(seconds)), 60)
+    hours, minute = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minute:02d}:{second:02d}"
+    return f"{minute:02d}:{second:02d}"
+
+
+def strip_numbered_suffix(title: str) -> str:
+    return re.sub(r"\s+\d+$", "", title).strip() or title
+
+
+def is_duplicate_folder_error(payload: dict[str, Any]) -> bool:
+    message = str(payload.get("message") or payload.get("msg") or "")
+    return "存在" in message or "重复" in message or "同名" in message
 
 
 def configure_logging(log_file: Path, verbose: bool) -> None:
