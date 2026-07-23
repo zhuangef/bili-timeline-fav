@@ -21,3 +21,7 @@ DAYS = 30
 
 # 只收藏时长不少于该秒数的视频。
 MIN_DURATION = 60
+
+# 只收藏这些关注分组中的 UP 主视频；留空表示不限制关注分组。
+# 例如：FOLLOW_GROUPS = ["科技", "影视"]
+FOLLOW_GROUPS = []
