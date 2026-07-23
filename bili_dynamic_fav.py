@@ -14,6 +14,7 @@ Authentication:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ import random
 import re
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -245,15 +247,21 @@ class BilibiliDynamicFavoriter:
 
         payload = self.get_json(RELATION_TAGS_URL, params={})
         tags = payload.get("data") or []
-        requested_names = set(group_names)
-        tag_ids = {
-            str(tag.get("name")): int(tag.get("tagid"))
-            for tag in tags
-            if str(tag.get("name")) in requested_names and str(tag.get("tagid") or "").lstrip("-").isdigit()
-        }
+        requested_names = {normalize_follow_group_name(name) for name in group_names}
+        tag_ids: dict[str, int] = {}
+        available_names: list[str] = []
+        for tag in tags:
+            raw_name = str(tag.get("name") or "")
+            normalized_name = normalize_follow_group_name(raw_name)
+            if normalized_name:
+                available_names.append(normalized_name)
+            raw_tag_id = str(tag.get("tagid") or "")
+            if normalized_name in requested_names and raw_tag_id.lstrip("-").isdigit():
+                tag_ids[normalized_name] = int(raw_tag_id)
+
         missing_names = sorted(requested_names - set(tag_ids))
         if missing_names:
-            available = ", ".join(str(tag.get("name")) for tag in tags if tag.get("name"))
+            available = ", ".join(available_names)
             raise ValueError(f"follow groups not found: {missing_names}; available groups: {available}")
 
         mids: set[int] = set()
@@ -410,16 +418,32 @@ def read_cookie_value(cookie_string: str, name: str) -> str:
     return unquote(match.group(1)) if match else ""
 
 
+def normalize_follow_group_name(name: str) -> str:
+    """统一关注分组名称，避免全角字符或隐藏空白导致匹配失败。"""
+    return unicodedata.normalize("NFKC", name).strip()
+
+
 def parse_follow_groups(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        raw_items = value.split(",")
+        stripped_value = value.strip()
+        if stripped_value.startswith("[") and stripped_value.endswith("]"):
+            try:
+                parsed_value = ast.literal_eval(stripped_value)
+            except (SyntaxError, ValueError):
+                raw_items = stripped_value.split(",")
+            else:
+                if isinstance(parsed_value, (list, tuple)):
+                    return parse_follow_groups(parsed_value)
+                raw_items = [stripped_value]
+        else:
+            raw_items = stripped_value.split(",")
     else:
         raw_items = []
         for item in value:
             raw_items.extend(str(item).split(","))
-    return [item.strip() for item in raw_items if item.strip()]
+    return [normalized for item in raw_items if (normalized := normalize_follow_group_name(item))]
 
 
 def read_cookie(args: argparse.Namespace) -> str:
